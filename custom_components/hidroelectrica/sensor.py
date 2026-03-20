@@ -11,6 +11,44 @@ from .const import DOMAIN, ATTRIBUTION
 
 _LOGGER = logging.getLogger(__name__)
 
+def _parse_hidroelectrica_date(date_str: str | None) -> datetime.date | None:
+    """
+    Parsează datele returnate de API în mai multe formate cunoscute și
+    returnează un obiect date. Dacă valoarea nu poate fi interpretată,
+    returnează None.
+    """
+    if not date_str:
+        return None
+
+    clean = str(date_str).strip()
+    if not clean:
+        return None
+
+    if "T" in clean:
+        clean = clean.split("T", 1)[0]
+    if " " in clean:
+        clean = clean.split(" ", 1)[0]
+
+    for fmt in ("%d/%m/%Y", "%Y%m%d", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.datetime.strptime(clean, fmt).date()
+        except ValueError:
+            continue
+
+    return None
+
+def _format_hidroelectrica_date(date_str: str | None) -> str | None:
+    """
+    Normalizează o dată în formatul afișat deja de ceilalți senzori:
+    DD/MM/YYYY.
+    """
+    parsed = _parse_hidroelectrica_date(date_str)
+    if parsed:
+        return parsed.strftime("%d/%m/%Y")
+    if date_str in (None, ""):
+        return None
+    return str(date_str)
+
 def _extract_year_from_dd_mm_yyyy(date_str: str) -> int:
     """
     Helper pentru a extrage anul dintr-un string gen "19/07/2023".
@@ -113,6 +151,27 @@ class HidroelectricaBaseSensor(CoordinatorEntity, SensorEntity):
     def _acc_data(self):
         return self.coordinator.data.get("accounts_data", {}).get(self._uan, {})
 
+    def _latest_due_date(self):
+        """
+        Returnează cea mai nouă dată scadentă disponibilă, preferând istoricul
+        de facturi când acesta conține o scadență mai recentă decât GetBill.
+        """
+        acc_data = self._acc_data()
+        bill = acc_data.get("get_bill", {}).get("result", {})
+        best_raw = bill.get("duedate")
+        best_date = _parse_hidroelectrica_date(best_raw)
+
+        history = acc_data.get("get_billing_history_list", {}).get("result", {})
+        invoices = history.get("objBillingHistoryEntity", []) or []
+        for invoice in invoices:
+            due_raw = invoice.get("dueDate") or invoice.get("duedate")
+            due_date = _parse_hidroelectrica_date(due_raw)
+            if due_date and (best_date is None or due_date > best_date):
+                best_date = due_date
+                best_raw = due_raw
+
+        return _format_hidroelectrica_date(best_raw)
+
 
 # ------------------------------------------------------------------------
 # DateContractSensor (unchanged)
@@ -127,19 +186,28 @@ class DateContractSensor(HidroelectricaBaseSensor):
 
     @property
     def native_value(self):
-        return self._acc_data().get("validate_user_login", {}).get("BPNumber")
+        val = self._acc_data().get("validate_user_login", {})
+        sett = self._acc_data().get("get_user_setting", {})
+
+        return (
+            val.get("UtilityAccountNumber")
+            or sett.get("UtilityAccountNumber")
+            or self._uan
+        )
 
     @property
     def extra_state_attributes(self):
         val = self._acc_data().get("validate_user_login", {})
         sett = self._acc_data().get("get_user_setting", {})
-        addr = val.get("Address", "N/A").split(", ")
         return {
             "Numele și prenumele": f"{val.get('FirstName','').capitalize()} {val.get('LastName','').capitalize()}",
             "Telefon de contact": val.get("PrimeryContactNumber", "N/A"),
+            "Număr cont utilitate": val.get("UtilityAccountNumber", self._uan),
+            "Număr cont": sett.get("AccountNumber", self._acc_no),
+            "Cod loc de consum (NLC)": val.get("BPNumber", "N/A"),
             "Localitate": val.get("CityName", "N/A").capitalize(),
             "Țară": val.get("Country", "N/A").capitalize(),
-            "Ultima actualizare de date": sett.get("LastUpdate", "N/A"),
+            "Ultima actualizare de date": _format_hidroelectrica_date(sett.get("LastUpdate")) or sett.get("LastUpdate", "N/A"),
             "attribution": ATTRIBUTION,
         }
 
@@ -254,7 +322,7 @@ class FacturaRestantaSensor(HidroelectricaBaseSensor):
     def extra_state_attributes(self):
         bill = self._acc_data().get("get_bill", {}).get("result", {})
         rem = bill.get("rembalance","0").replace(",",".")
-        dued = bill.get("duedate")
+        dued = self._latest_due_date()
         attrs: dict[str, any] = {"attribution": ATTRIBUTION}
         try:
             rem_v = float(rem)
@@ -265,7 +333,9 @@ class FacturaRestantaSensor(HidroelectricaBaseSensor):
             days_over_text = ""
             if dued:
                 try:
-                    due_date = datetime.datetime.strptime(dued, "%d/%m/%Y").date()
+                    due_date = _parse_hidroelectrica_date(dued)
+                    if due_date is None:
+                        raise ValueError("Invalid due date")
                     delta = (datetime.date.today() - due_date).days
                     days_over_text = f", depășită cu {delta} zile" if delta > 0 else ""
                 except Exception:
@@ -342,15 +412,7 @@ class DataScadentaSensor(HidroelectricaBaseSensor):
 
     @property
     def native_value(self):
-        bill = self._acc_data().get("get_bill", {}).get("result", {})
-        dued = bill.get("duedate")
-        if not dued:
-            return None
-        try:
-            # API returns "DD/MM/YYYY"
-            return datetime.datetime.strptime(dued, "%d/%m/%Y").date()
-        except ValueError:
-            return dued  # fallback to raw string if parse fails
+        return self._latest_due_date()
 
 
 # ------------------------------------------------------------------------
